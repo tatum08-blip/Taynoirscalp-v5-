@@ -1289,6 +1289,14 @@ class DerivConn:
         token = Config.DERIV_TOKEN_REAL if Config.TRADE_MODE=="real" else Config.DERIV_TOKEN_DEMO
         if not token:
             log.warning("Deriv: pas de token"); return False
+        # Ferme proprement une éventuelle connexion précédente avant d'en ouvrir
+        # une nouvelle — sans ça, chaque reconnexion empile un socket et un
+        # thread supplémentaires au lieu de remplacer l'ancien.
+        if self.ws:
+            try: self.ws.close()
+            except Exception: pass
+        self.connected = False
+        self.authorized = False
         url = f"{Config.DERIV_WS}?app_id={Config.DERIV_APP_ID}"
         try:
             self.ws = websocket.WebSocketApp(
@@ -1298,7 +1306,15 @@ class DerivConn:
                 on_error   = lambda ws, e: self._on_error(ws, e),
                 on_close   = lambda ws, c, m: self._on_close(ws, c, m),
             )
-            threading.Thread(target=self.ws.run_forever, daemon=True).start()
+            # ping_interval/ping_timeout : SANS ça, la connexion reste "silencieuse"
+            # entre deux scans (5 min) et se fait couper pour inactivité — que ce
+            # soit par Deriv ou par le proxy réseau de Railway. C'était la vraie
+            # cause des déconnexions en boucle toutes les ~30s observées en logs.
+            threading.Thread(
+                target=self.ws.run_forever,
+                kwargs={"ping_interval": 20, "ping_timeout": 10},
+                daemon=True,
+            ).start()
             deadline = time.time() + 6
             while not self.connected and time.time() < deadline:
                 time.sleep(0.1)
