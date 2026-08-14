@@ -256,6 +256,10 @@ def save_db(db):
         log.error(f"save_db: {e}")
 
 db = load_db()
+# db est lu/modifié depuis plusieurs threads (scan principal + PositionManager
+# qui tourne en parallèle pour le SAR) — ce verrou évite les corruptions de
+# compteurs (capital, win rate, etc) en cas d'accès simultané.
+db_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INDICATEURS TECHNIQUES (tous validés mathématiquement)
@@ -1174,57 +1178,60 @@ class TradingGuard:
     @staticmethod
     def check_and_pause(db_data):
         """Arrête le bot après MAX_CONSEC_LOSSES SL consécutifs"""
-        consec = db_data["perf"].get("consec_losses", 0)
-        if consec >= Config.MAX_CONSEC_LOSSES:
-            # Pause jusqu'à minuit
-            tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=0,minute=0,second=0)
-            db_data["adaptive"]["paused_until"] = tomorrow.isoformat()
-            db_data["adaptive"]["pause_reason"] = f"{consec} SL consécutifs"
-            save_db(db_data)
-            log.warning(f"🛑 BOT PAUSÉ — {consec} SL consécutifs — reprise {tomorrow.strftime('%H:%M')}")
-            Notifier.send("PAUSE", f"Bot pausé automatiquement — {consec} SL consécutifs. Reprise demain 00h00.")
-            return False
-        return True
+        with db_lock:
+            consec = db_data["perf"].get("consec_losses", 0)
+            if consec >= Config.MAX_CONSEC_LOSSES:
+                # Pause jusqu'à minuit
+                tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=0,minute=0,second=0)
+                db_data["adaptive"]["paused_until"] = tomorrow.isoformat()
+                db_data["adaptive"]["pause_reason"] = f"{consec} SL consécutifs"
+                save_db(db_data)
+                log.warning(f"🛑 BOT PAUSÉ — {consec} SL consécutifs — reprise {tomorrow.strftime('%H:%M')}")
+                Notifier.send("PAUSE", f"Bot pausé automatiquement — {consec} SL consécutifs. Reprise demain 00h00.")
+                return False
+            return True
 
     @staticmethod
     def is_paused(db_data):
-        paused_until = db_data["adaptive"].get("paused_until")
-        if not paused_until:
-            return False
-        try:
-            pt = datetime.fromisoformat(paused_until)
-            if datetime.now() < pt:
-                return True
-            else:
-                db_data["adaptive"]["paused_until"] = None
-                db_data["adaptive"]["pause_reason"] = ""
-                db_data["perf"]["consec_losses"] = 0
-                save_db(db_data)
+        with db_lock:
+            paused_until = db_data["adaptive"].get("paused_until")
+            if not paused_until:
                 return False
-        except:
-            return False
+            try:
+                pt = datetime.fromisoformat(paused_until)
+                if datetime.now() < pt:
+                    return True
+                else:
+                    db_data["adaptive"]["paused_until"] = None
+                    db_data["adaptive"]["pause_reason"] = ""
+                    db_data["perf"]["consec_losses"] = 0
+                    save_db(db_data)
+                    return False
+            except:
+                return False
 
     @staticmethod
     def record_result(db_data, won: bool, pnl: float):
-        perf = db_data["perf"]
-        if won:
-            perf["wins"] += 1
-            perf["consec_losses"] = 0
-            perf["consec_wins"]   = perf.get("consec_wins", 0) + 1
-        else:
-            perf["losses"] += 1
-            perf["consec_losses"] = perf.get("consec_losses", 0) + 1
-            perf["consec_wins"]   = 0
-        perf["total"] += 1
-        perf["pnl"]   = round(perf.get("pnl", 0) + pnl, 2)
-        cap = db_data.get("capital", Config.CAPITAL) + pnl
-        db_data["capital"] = max(0, round(cap, 2))
-        if db_data["capital"] > perf.get("peak", 0):
-            perf["peak"] = db_data["capital"]
-        dd = (perf["peak"] - db_data["capital"]) / max(perf["peak"], 1) * 100
-        if dd > perf.get("max_dd", 0):
-            perf["max_dd"] = round(dd, 2)
-        save_db(db_data)
+        with db_lock:
+            perf = db_data["perf"]
+            if won:
+                perf["wins"] += 1
+                perf["consec_losses"] = 0
+                perf["consec_wins"]   = perf.get("consec_wins", 0) + 1
+            else:
+                perf["losses"] += 1
+                perf["consec_losses"] = perf.get("consec_losses", 0) + 1
+                perf["consec_wins"]   = 0
+            perf["total"] += 1
+            perf["pnl"]   = round(perf.get("pnl", 0) + pnl, 2)
+            cap = db_data.get("capital", Config.CAPITAL) + pnl
+            db_data["capital"] = max(0, round(cap, 2))
+            if db_data["capital"] > perf.get("peak", 0):
+                perf["peak"] = db_data["capital"]
+            dd = (perf["peak"] - db_data["capital"]) / max(perf["peak"], 1) * 100
+            if dd > perf.get("max_dd", 0):
+                perf["max_dd"] = round(dd, 2)
+            save_db(db_data)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONNEXION DERIV
@@ -1549,16 +1556,19 @@ class PositionManager:
                 "flips": 0,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
             }
-        db["trades"].append({
-            "pair": pair_id, "direction": direction, "confidence": sig.get("confidence"),
-            "entry": sig["price"], "sl": sig["sl"], "tp1": sig.get("tp1"),
-            "tp2": sig.get("tp2"), "tp3": sig.get("tp3"),
-            "rr1": sig.get("rr1"), "lot": stake, "risk_usd": stake,
-            "time": datetime.now(timezone.utc).isoformat(),
-            "status": "open", "pnl": 0, "mode": Config.TRADE_MODE, "sar_flip": 0,
-        })
-        db["perf"]["total"] = db["perf"].get("total", 0) + 1
-        save_db(db)
+        with db_lock:
+            db["trades"].append({
+                "pair": pair_id, "direction": direction, "confidence": sig.get("confidence"),
+                "entry": sig["price"], "sl": sig["sl"], "tp1": sig.get("tp1"),
+                "tp2": sig.get("tp2"), "tp3": sig.get("tp3"),
+                "rr1": sig.get("rr1"), "lot": stake, "risk_usd": stake,
+                "time": datetime.now(timezone.utc).isoformat(),
+                "status": "open", "pnl": 0, "mode": Config.TRADE_MODE, "sar_flip": 0,
+            })
+            # NB: perf["total"] est incrémenté à la CLÔTURE (dans TradingGuard.record_result),
+            # pas ici à l'ouverture — sinon chaque trade est compté deux fois et le win rate
+            # affiché est faussé.
+            save_db(db)
         Notifier.send("OPEN", f"{direction} {pair_id} @ {sig['price']} | SL initial {sig['sl']}", {"pair": pair_id})
         return self.positions[pair_id]
 
@@ -1593,15 +1603,16 @@ class PositionManager:
     def _record_close(self, pos, pnl, won):
         TradingGuard.record_result(db, won, pnl)
         update_daily(pnl, 1 if won else -1)
-        for strat in pos.get("strategies", []):
-            sp = db["strategy_perf"].setdefault(strat, {"wins": 0, "losses": 0})
-            sp["wins" if won else "losses"] += 1
-        for t in reversed(db["trades"]):
-            if t.get("pair") == pos["pair_id"] and t.get("status") == "open":
-                t["status"] = "closed"; t["pnl"] = round(pnl, 2)
-                t["closed_at"] = datetime.now(timezone.utc).isoformat()
-                break
-        save_db(db)
+        with db_lock:
+            for strat in pos.get("strategies", []):
+                sp = db.setdefault("strategy_perf", {}).setdefault(strat, {"wins": 0, "losses": 0})
+                sp["wins" if won else "losses"] += 1
+            for t in reversed(db["trades"]):
+                if t.get("pair") == pos["pair_id"] and t.get("status") == "open":
+                    t["status"] = "closed"; t["pnl"] = round(pnl, 2)
+                    t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+            save_db(db)
 
     def _flip(self, pair_id, pos, current_price):
         close_res = deriv.close_position(pos["contract_id"])
@@ -1653,13 +1664,14 @@ class PositionManager:
                 "current_sl_price": new_sl,
                 "stake": stake,
             })
-        db["trades"].append({
-            "pair": pair_id, "direction": new_direction, "entry": current_price,
-            "sl": new_sl, "time": datetime.now(timezone.utc).isoformat(),
-            "status": "open", "pnl": 0, "mode": Config.TRADE_MODE,
-            "sar_flip": pos["flips"],
-        })
-        save_db(db)
+        with db_lock:
+            db["trades"].append({
+                "pair": pair_id, "direction": new_direction, "entry": current_price,
+                "sl": new_sl, "time": datetime.now(timezone.utc).isoformat(),
+                "status": "open", "pnl": 0, "mode": Config.TRADE_MODE,
+                "sar_flip": pos["flips"],
+            })
+            save_db(db)
         Notifier.send("SAR_FLIP", f"{pair_id} retourné → {new_direction} @ {current_price} (flip #{pos['flips']})")
 
     def tick(self):
@@ -1941,15 +1953,16 @@ def is_dup(pair_id, direction, cooldown=1800):
     _last_sig[key]=time.time(); return False
 
 def update_daily(pnl, won):
-    today=datetime.now().strftime("%Y-%m-%d")
-    if today not in db["daily"]:
-        db["daily"][today]={"trades":0,"wins":0,"losses":0,"be":0,"pnl":0.0}
-    d=db["daily"][today]; d["trades"]+=1
-    if won>0:   d["wins"]+=1
-    elif won<0: d["losses"]+=1
-    else:       d["be"]+=1
-    d["pnl"]=round(d.get("pnl",0)+pnl,2)
-    save_db(db)
+    with db_lock:
+        today=datetime.now().strftime("%Y-%m-%d")
+        if today not in db["daily"]:
+            db["daily"][today]={"trades":0,"wins":0,"losses":0,"be":0,"pnl":0.0}
+        d=db["daily"][today]; d["trades"]+=1
+        if won>0:   d["wins"]+=1
+        elif won<0: d["losses"]+=1
+        else:       d["be"]+=1
+        d["pnl"]=round(d.get("pnl",0)+pnl,2)
+        save_db(db)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCAN PRINCIPAL
@@ -2039,20 +2052,22 @@ def adaptive_update():
        à désactiver manuellement — le bot ne la coupe pas tout seul (trop risqué
        de le faire sans supervision), mais il te le dit clairement dans les logs.
     """
-    recent = db.get("trades", [])[-20:]
-    if len(recent) >= 5:
-        wins = sum(1 for t in recent if t.get("pnl", 0) > 0)
-        rwr  = wins / len(recent) * 100
-        adapt = db.get("adaptive", {})
-        if rwr >= 70:
-            adapt["conf_threshold"] = max(65, adapt.get("conf_threshold", 78) - 1)
-        elif rwr < 50:
-            adapt["conf_threshold"] = min(90, adapt.get("conf_threshold", 78) + 2)
-        Config.MIN_CONF_TRADE = adapt["conf_threshold"]
-        db["adaptive"] = adapt
-        log.info(f"🧠 Adaptatif: seuil={adapt['conf_threshold']}% | WR récent={rwr:.0f}%")
+    with db_lock:
+        recent = list(db.get("trades", []))[-20:]
+        if len(recent) >= 5:
+            wins = sum(1 for t in recent if t.get("pnl", 0) > 0)
+            rwr  = wins / len(recent) * 100
+            adapt = db.get("adaptive", {})
+            if rwr >= 70:
+                adapt["conf_threshold"] = max(65, adapt.get("conf_threshold", 78) - 1)
+            elif rwr < 50:
+                adapt["conf_threshold"] = min(90, adapt.get("conf_threshold", 78) + 2)
+            Config.MIN_CONF_TRADE = adapt["conf_threshold"]
+            db["adaptive"] = adapt
+            log.info(f"🧠 Adaptatif: seuil={adapt['conf_threshold']}% | WR récent={rwr:.0f}%")
 
-    sp = db.get("strategy_perf", {})
+        sp = dict(db.get("strategy_perf", {}))  # copie pour itérer sans risque si un autre thread écrit
+
     weak = []
     for name, s in sp.items():
         total = s.get("wins", 0) + s.get("losses", 0)
@@ -2062,11 +2077,37 @@ def adaptive_update():
                 weak.append((name, round(wr, 1), total))
     if weak:
         log.warning(f"🧠 Stratégies faibles en LIVE (WR<35%, n≥10) : {weak} — envisage de les désactiver dans StrategyEngine")
-    save_db(db)
+    with db_lock:
+        save_db(db)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
+def deriv_supervisor():
+    """
+    Le message de log 'reconnexion sera tentée par le superviseur' ne servait
+    à rien tant que ce superviseur n'existait pas — c'est corrigé ici.
+    Vérifié toutes les 30 secondes : si la connexion Deriv est tombée,
+    on la rétablit. PositionManager et DerivConn utilisent l'objet global
+    `deriv`, donc dès que .authorized redevient True, tout continue de
+    fonctionner sans rien relancer d'autre.
+    """
+    if not (Config.DERIV_TOKEN_DEMO or Config.DERIV_TOKEN_REAL):
+        return
+    if deriv.connected and deriv.authorized:
+        return
+    log.warning("🔌 Deriv déconnecté — tentative de reconnexion...")
+    ok = deriv.connect()
+    if ok:
+        log.info("✅ Deriv reconnecté")
+        Notifier.send("RECONNECT", "Connexion Deriv rétablie après coupure")
+        global position_manager
+        if position_manager is None:
+            position_manager = PositionManager()
+            threading.Thread(target=position_manager.run_forever, daemon=True).start()
+    else:
+        log.error("❌ Reconnexion Deriv échouée — nouvel essai dans 30s")
+
 def main():
     global position_manager
     log.info("╔══════════════════════════════════════════════════════════════╗")
@@ -2108,6 +2149,7 @@ def main():
     schedule.every(5).minutes.do(main_scan)
     schedule.every(1).minutes.do(daily_check)
     schedule.every(30).minutes.do(adaptive_update)
+    schedule.every(30).seconds.do(deriv_supervisor)
 
     log.info("\n🚀 Scan initial...")
     main_scan()
