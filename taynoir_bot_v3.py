@@ -50,12 +50,21 @@ log = logging.getLogger("TAYNOIR_V2")
 #  CONFIG CENTRALE
 # ══════════════════════════════════════════════════════════════════════════════
 class Config:
-    TRADE_MODE         = os.getenv("TRADE_MODE", "demo")
-    # Deriv
-    DERIV_APP_ID       = os.getenv("DERIV_APP_ID", "1089")
-    DERIV_TOKEN_DEMO   = os.getenv("DERIV_TOKEN_DEMO", "")
-    DERIV_TOKEN_REAL   = os.getenv("DERIV_TOKEN_REAL", "")
-    DERIV_WS           = "wss://ws.binaryws.com/websockets/v3"
+    TRADE_MODE         = os.getenv("TRADE_MODE", "demo").strip().lower()
+    # Deriv — nouvelle API (PAT/JWT + REST OTP + WebSocket authentifié)
+    # DERIV_APP_ID est l'App ID de la NOUVELLE application Deriv.
+    # Ne pas mettre l'ancien App ID legacy (ex. 1089) avec un PAT pat_...
+    DERIV_APP_ID       = os.getenv("DERIV_APP_ID", os.getenv("DERIV_CLIENT_ID", "")).strip()
+    DERIV_TOKEN_DEMO   = os.getenv("DERIV_TOKEN_DEMO", "").strip()
+    DERIV_TOKEN_REAL   = os.getenv("DERIV_TOKEN_REAL", "").strip()
+    DERIV_ACCOUNT_ID   = os.getenv("DERIV_ACCOUNT_ID", "").strip()
+    DERIV_ACCOUNT_ID_DEMO = os.getenv("DERIV_ACCOUNT_ID_DEMO", "").strip()
+    DERIV_ACCOUNT_ID_REAL = os.getenv("DERIV_ACCOUNT_ID_REAL", "").strip()
+    DERIV_API_BASE     = os.getenv("DERIV_API_BASE", "https://api.derivws.com").rstrip("/")
+    # Public WebSocket : utilisé uniquement pour les données de marché synthétiques.
+    DERIV_WS_PUBLIC    = os.getenv("DERIV_WS_PUBLIC", "wss://api.derivws.com/trading/v1/options/ws/public")
+    # Ancien endpoint conservé uniquement pour compatibilité avec un ancien token
+    # non-PAT. Les PAT modernes passent obligatoirement par l'OTP REST ci-dessus.
     # Exness / MT5 universel
     MT5_LOGIN          = int(os.getenv("MT5_LOGIN", "0"))
     MT5_PASSWORD       = os.getenv("MT5_PASSWORD", "")
@@ -1237,28 +1246,29 @@ class TradingGuard:
 #  CONNEXION DERIV
 # ══════════════════════════════════════════════════════════════════════════════
 class DerivConn:
+    """Connexion Deriv New API : PAT/JWT -> REST -> OTP -> WebSocket.
+
+    IMPORTANT : un PAT moderne (ex. ``pat_...``) n'est jamais envoyé avec
+    ``authorize`` sur l'ancien WebSocket v3. Le PAT est utilisé comme Bearer
+    token avec ``Deriv-App-ID`` pour obtenir l'URL WebSocket OTP.
     """
-    IMPORTANT — pourquoi Multipliers et pas CALL/PUT :
-    Les contrats CALL/PUT (options binaires) ont une durée fixe et expirent
-    automatiquement — impossible de bouger un SL dessus, donc impossible de
-    faire du trailing ou du stop-and-reverse. Les contrats MULTUP/MULTDOWN
-    (Multipliers) se comportent comme un CFD à effet de levier : ils ont un
-    stop_loss modifiable en direct via `contract_update`, et peuvent être
-    fermés à tout moment via `sell`. C'est le seul type de contrat Deriv qui
-    permet ce que tu veux faire.
-    À TESTER EN DEMO D'ABORD — vérifie que le multiplicateur choisi est
-    disponible sur le compte (Deriv limite les multiplicateurs par actif).
-    """
+
     def __init__(self):
-        self.ws = None; self.connected = False; self.authorized = False
-        self.balance = 0.0; self.currency = "USD"
-        self._lock = threading.Lock(); self._msg_id = 0
-        self._pending = {}   # req_id -> threading.Event
-        self._responses = {} # req_id -> message dict
+        self.ws = None
+        self.connected = False
+        self.authorized = False
+        self.balance = 0.0
+        self.currency = "USD"
+        self.account_id = None
+        self._lock = threading.Lock()
+        self._msg_id = 0
+        self._pending = {}
+        self._responses = {}
 
     def _next_id(self):
         with self._lock:
-            self._msg_id += 1; return self._msg_id
+            self._msg_id += 1
+            return self._msg_id
 
     def _send(self, data):
         try:
@@ -1270,81 +1280,285 @@ class DerivConn:
         return False
 
     def _request(self, data: dict, timeout: float = 10.0) -> dict | None:
-        """Envoie une requête et attend la réponse correspondante (par req_id)."""
+        """Envoie une requête WS et attend la réponse portant le même req_id."""
         req_id = self._next_id()
+        data = dict(data)
         data["req_id"] = req_id
         ev = threading.Event()
-        self._pending[req_id] = ev
+        with self._lock:
+            self._pending[req_id] = ev
         if not self._send(data):
-            self._pending.pop(req_id, None)
+            with self._lock:
+                self._pending.pop(req_id, None)
             return None
         got = ev.wait(timeout)
-        self._pending.pop(req_id, None)
-        resp = self._responses.pop(req_id, None)
+        with self._lock:
+            self._pending.pop(req_id, None)
+            resp = self._responses.pop(req_id, None)
         if not got:
-            log.warning(f"Deriv: timeout sur requête {data.get('req_id')}")
+            log.warning(f"Deriv: timeout sur requête req_id={req_id}")
         return resp
 
+    @staticmethod
+    def _extract_accounts(payload):
+        """Normalise les réponses GET /options/accounts (objet ou liste)."""
+        if not isinstance(payload, dict):
+            return []
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            if "account_id" in data or "accountId" in data or "id" in data:
+                return [data]
+            for key in ("accounts", "items", "data"):
+                if isinstance(data.get(key), list):
+                    return [x for x in data[key] if isinstance(x, dict)]
+        for key in ("accounts", "items"):
+            if isinstance(payload.get(key), list):
+                return [x for x in payload[key] if isinstance(x, dict)]
+        return []
+
+    @staticmethod
+    def _account_id(account: dict):
+        for key in ("account_id", "accountId", "id"):
+            value = account.get(key)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _account_type(account: dict):
+        value = str(account.get("account_type", account.get("type", ""))).strip().lower()
+        if value in {"demo", "virtual"}:
+            return "demo"
+        if value in {"real", "live"}:
+            return "real"
+        return None
+
+    def _headers(self, token):
+        return {
+            "Authorization": f"Bearer {token}",
+            "Deriv-App-ID": Config.DERIV_APP_ID,
+            "Content-Type": "application/json",
+        }
+
+    def _discover_account(self, token):
+        """Trouve le compte Options correspondant au mode demo/real."""
+        explicit = Config.DERIV_ACCOUNT_ID
+        if not explicit:
+            explicit = (
+                Config.DERIV_ACCOUNT_ID_REAL
+                if Config.TRADE_MODE == "real"
+                else Config.DERIV_ACCOUNT_ID_DEMO
+            )
+        if explicit:
+            self.account_id = explicit.strip()
+            log.info(f"Deriv compte configuré: {self.account_id}")
+            return self.account_id
+
+        try:
+            r = requests.get(
+                f"{Config.DERIV_API_BASE}/trading/v1/options/accounts",
+                headers=self._headers(token),
+                timeout=15,
+            )
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {}
+
+            if r.status_code != 200:
+                log.error(f"Deriv comptes HTTP {r.status_code}: {payload or r.text[:500]}")
+                return None
+
+            accounts = self._extract_accounts(payload)
+            wanted = "real" if Config.TRADE_MODE == "real" else "demo"
+            matching = [a for a in accounts if self._account_type(a) == wanted]
+
+            if len(matching) == 1:
+                self.account_id = self._account_id(matching[0])
+                log.info(f"Deriv compte {wanted} détecté: {self.account_id}")
+                return self.account_id
+
+            if len(matching) > 1:
+                log.error(
+                    f"Deriv: plusieurs comptes {wanted} détectés. "
+                    f"Définis DERIV_ACCOUNT_ID_{wanted.upper()} dans Railway."
+                )
+                return None
+
+            log.error(
+                f"Deriv: aucun compte Options {wanted} trouvé. "
+                "Vérifie le PAT et son scope 'trade', ou définis explicitement "
+                f"DERIV_ACCOUNT_ID_{wanted.upper()}."
+            )
+            return None
+        except requests.RequestException as e:
+            log.error(f"Deriv découverte compte: erreur réseau: {e}")
+            return None
+        except Exception as e:
+            log.error(f"Deriv découverte compte: {e}")
+            return None
+
+    def _get_authenticated_ws_url(self, token):
+        """Obtient l'URL WebSocket OTP à usage unique."""
+        account_id = self._discover_account(token)
+        if not account_id:
+            return None
+
+        try:
+            r = requests.post(
+                f"{Config.DERIV_API_BASE}/trading/v1/options/accounts/{account_id}/otp",
+                headers=self._headers(token),
+                timeout=15,
+            )
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {}
+
+            if r.status_code != 200:
+                if r.status_code == 401:
+                    log.error(
+                        "Deriv OTP HTTP 401: PAT invalide/expiré, mauvais App ID, "
+                        "ou PAT sans scope 'trade'."
+                    )
+                elif r.status_code == 403:
+                    log.error("Deriv OTP HTTP 403: application/token non autorisé pour le compte.")
+                else:
+                    log.error(f"Deriv OTP HTTP {r.status_code}: {payload or r.text[:500]}")
+                return None
+
+            data = payload.get("data")
+            ws_url = data.get("url") if isinstance(data, dict) else None
+            if not ws_url or not isinstance(ws_url, str):
+                log.error(f"Deriv OTP: réponse sans URL WebSocket: {payload}")
+                return None
+            return ws_url
+        except requests.RequestException as e:
+            log.error(f"Deriv OTP: erreur réseau: {e}")
+            return None
+        except Exception as e:
+            log.error(f"Deriv OTP: {e}")
+            return None
+
     def connect(self):
-        token = Config.DERIV_TOKEN_REAL if Config.TRADE_MODE=="real" else Config.DERIV_TOKEN_DEMO
+        token = (
+            Config.DERIV_TOKEN_REAL
+            if Config.TRADE_MODE == "real"
+            else Config.DERIV_TOKEN_DEMO
+        ).strip()
+
         if not token:
-            log.warning("Deriv: pas de token"); return False
-        # Ferme proprement une éventuelle connexion précédente avant d'en ouvrir
-        # une nouvelle — sans ça, chaque reconnexion empile un socket et un
-        # thread supplémentaires au lieu de remplacer l'ancien.
+            log.warning("Deriv: token PAT absent")
+            return False
+        if not Config.DERIV_APP_ID:
+            log.error("Deriv: DERIV_APP_ID est obligatoire avec la nouvelle API.")
+            return False
+        if not Config.DERIV_API_BASE.startswith("https://"):
+            log.error("Deriv: DERIV_API_BASE doit utiliser HTTPS.")
+            return False
+
+        # Nouvelle API uniquement : aucune tentative de authorize(token) legacy.
+        url = self._get_authenticated_ws_url(token)
+        if not url:
+            return False
+
         if self.ws:
-            try: self.ws.close()
-            except Exception: pass
-        self.connected = False
-        self.authorized = False
-        url = f"{Config.DERIV_WS}?app_id={Config.DERIV_APP_ID}"
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+        with self._lock:
+            self.connected = False
+            self.authorized = False
+            self._pending.clear()
+            self._responses.clear()
+
         try:
             self.ws = websocket.WebSocketApp(
                 url,
-                on_open    = lambda ws: self._on_open(ws),
-                on_message = lambda ws, m: self._on_message(ws, m),
-                on_error   = lambda ws, e: self._on_error(ws, e),
-                on_close   = lambda ws, c, m: self._on_close(ws, c, m),
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
             )
-            # ping_interval/ping_timeout : SANS ça, la connexion reste "silencieuse"
-            # entre deux scans (5 min) et se fait couper pour inactivité — que ce
-            # soit par Deriv ou par le proxy réseau de Railway. C'était la vraie
-            # cause des déconnexions en boucle toutes les ~30s observées en logs.
             threading.Thread(
                 target=self.ws.run_forever,
                 kwargs={"ping_interval": 20, "ping_timeout": 10},
                 daemon=True,
+                name="deriv-ws",
             ).start()
-            deadline = time.time() + 6
+
+            deadline = time.time() + 15
             while not self.connected and time.time() < deadline:
                 time.sleep(0.1)
-            if self.connected:
-                resp = self._request({"authorize": token})
-                if resp and not resp.get("error"):
-                    self.authorized = True
-                    self.balance  = float(resp["authorize"].get("balance", 0))
-                    self.currency = resp["authorize"].get("currency", "USD")
-                    log.info(f"✅ Deriv autorisé | Solde: {self.balance} {self.currency}")
-                elif resp:
-                    log.error(f"Deriv auth: {resp['error']['message']}")
-            return self.authorized
+
+            if not self.connected:
+                log.error("Deriv: WebSocket non connecté dans le délai")
+                return False
+
+            # L'OTP dans l'URL authentifie déjà la session.
+            resp = self._request({"balance": 1}, timeout=10)
+            if resp and resp.get("error"):
+                log.error(f"Deriv session: {resp['error'].get('message', 'erreur inconnue')}")
+                return False
+
+            bal = resp.get("balance") if resp else None
+            if not isinstance(bal, dict):
+                log.error(f"Deriv session: réponse balance invalide: {resp}")
+                return False
+
+            try:
+                self.balance = float(bal.get("balance", 0))
+            except (TypeError, ValueError):
+                log.error(f"Deriv session: solde invalide: {bal.get('balance')}")
+                return False
+
+            self.currency = str(bal.get("currency") or "USD")
+            self.authorized = True
+            log.info(
+                f"✅ Deriv PAT/OTP autorisé | Compte: {self.account_id} | "
+                f"Solde: {self.balance:.2f} {self.currency}"
+            )
+            return True
         except Exception as e:
-            log.error(f"Deriv connect: {e}"); return False
+            log.error(f"Deriv connect: {e}")
+            return False
 
     def _on_open(self, ws):
-        self.connected = True; log.info("✅ Deriv WebSocket connecté")
+        self.connected = True
+        log.info("✅ Deriv WebSocket connecté (OTP)")
+
     def _on_error(self, ws, e):
-        log.error(f"Deriv WS error: {e}"); self.connected = False
+        log.error(f"Deriv WS error: {e}")
+        self.connected = False
+        self.authorized = False
+
     def _on_close(self, ws, c, m):
-        self.connected = False; self.authorized = False
-        log.warning("Deriv WS fermé — reconnexion sera tentée par le superviseur")
+        self.connected = False
+        self.authorized = False
+        log.warning(f"Deriv WS fermé (code={c}) — reconnexion sera tentée par le superviseur")
+        with self._lock:
+            for ev in self._pending.values():
+                ev.set()
+            self._pending.clear()
+            self._responses.clear()
+
     def _on_message(self, ws, message):
         try:
             msg = json.loads(message)
+            if msg.get("error") and msg.get("req_id") is None:
+                log.error(f"Deriv WS: {msg['error'].get('message', msg['error'])}")
+                return
             req_id = msg.get("req_id")
-            if req_id is not None and req_id in self._pending:
-                self._responses[req_id] = msg
-                self._pending[req_id].set()
+            if req_id is not None:
+                with self._lock:
+                    ev = self._pending.get(req_id)
+                    if ev:
+                        self._responses[req_id] = msg
+                        ev.set()
         except Exception as e:
             log.error(f"Deriv msg: {e}")
 
@@ -1355,79 +1569,141 @@ class DerivConn:
             return None
         return deriv_sym
 
+    def _loss_amount_for_price(self, stake, multiplier, entry_price, stop_price):
+        """Convertit une distance de prix en perte monétaire Multiplier."""
+        if entry_price <= 0 or stop_price <= 0:
+            return stake
+        pct_move = abs(stop_price - entry_price) / entry_price
+        amount = stake * multiplier * pct_move
+        # Une position Multiplier ne peut pas perdre plus que son stake.
+        return round(max(0.01, min(float(stake), amount)), 2)
+
     def open_position(self, pair_id, direction, stake, sl_distance_price, multiplier=None):
-        """
-        Ouvre un contrat Multiplier (MULTUP/MULTDOWN) avec stop_loss natif.
-        sl_distance_price : distance du SL par rapport au prix d'entrée, EN PRIX (pas en %),
-        c'est le SL calculé par la stratégie (ATR-based).
-        Retourne {"status": "ok", "contract_id":..., "buy_price":..., "entry_spot":...} ou erreur.
-        """
-        if not self.authorized:
-            return {"status": "error", "reason": "Deriv non autorisé"}
+        """Demande une proposition puis achète le Multiplier avec SL natif."""
+        if not self.authorized or not self.connected:
+            return {"status": "error", "reason": "Deriv non autorisé/connecté"}
+
         deriv_sym = self._resolve_symbol(pair_id)
         if not deriv_sym:
             return {"status": "error", "reason": "Symbole non autorisé pour Multiplier"}
 
-        stake = max(1.0, min(stake, self.balance * 0.15))
-        mult = multiplier or int(os.getenv("DERIV_DEFAULT_MULTIPLIER", "50"))
+        try:
+            stake = float(stake)
+        except (TypeError, ValueError):
+            return {"status": "error", "reason": "Stake invalide"}
+        if self.balance < 1.0 or stake <= 0:
+            return {"status": "error", "reason": "Solde Deriv insuffisant"}
+        stake = min(stake, self.balance * 0.15)
+        if stake <= 0:
+            return {"status": "error", "reason": "Stake calculé invalide"}
 
-        # Deriv veut le SL en perte monétaire max, pas en prix — on l'approxime
-        # depuis la distance prix fournie par la stratégie (proportionnalité stake/levier).
-        params = {
-            "buy": 1,
-            "price": stake,
-            "parameters": {
-                "contract_type": "MULTUP" if direction == "BUY" else "MULTDOWN",
-                "symbol": deriv_sym,
-                "multiplier": mult,
-                "basis": "stake",
-                "amount": stake,
-                "currency": self.currency,
-                "limit_order": {
-                    "stop_loss": round(stake * 0.9, 2)  # borne de sécurité initiale, resserrée par le PositionManager
-                },
-            },
+        mult = multiplier or int(os.getenv("DERIV_DEFAULT_MULTIPLIER", "50"))
+        if mult <= 0:
+            return {"status": "error", "reason": "Multiplier invalide"}
+
+        # Le prix d'entrée n'est pas encore connu avec certitude : on demande
+        # d'abord une proposition officielle à Deriv.
+        proposal_req = {
+            "proposal": 1,
+            "amount": round(stake, 2),
+            "basis": "stake",
+            "contract_type": "MULTUP" if direction == "BUY" else "MULTDOWN",
+            "currency": self.currency,
+            "multiplier": mult,
+            "underlying_symbol": deriv_sym,
+            "subscribe": 0,
         }
-        resp = self._request(params, timeout=10)
-        if not resp:
-            return {"status": "error", "reason": "Pas de réponse Deriv (timeout)"}
-        if resp.get("error"):
-            return {"status": "error", "reason": resp["error"].get("message", "erreur inconnue")}
-        buy = resp.get("buy", {})
-        log.info(f"✅ Position Deriv ouverte: #{buy.get('contract_id')} {direction} {deriv_sym} stake={stake}")
+        if sl_distance_price and sl_distance_price > 0:
+            # La stratégie fournit une distance de SL en prix. La proposition
+            # accepte un stop_loss monétaire, donc on l'estime ensuite avec
+            # l'entry spot retourné par la proposition si disponible.
+            proposal_req["limit_order"] = {"stop_loss": round(min(stake, stake * 0.90), 2)}
+
+        proposal_resp = self._request(proposal_req, timeout=12)
+        if not proposal_resp:
+            return {"status": "error", "reason": "Timeout proposition Deriv"}
+        if proposal_resp.get("error"):
+            return {"status": "error", "reason": proposal_resp["error"].get("message", "proposition refusée")}
+
+        proposal = proposal_resp.get("proposal") or {}
+        proposal_id = proposal.get("id")
+        if not proposal_id:
+            return {"status": "error", "reason": f"Réponse proposition sans id: {proposal_resp}"}
+
+        # Le prix demandé au buy est la mise maximale acceptée.
+        buy_resp = self._request({
+            "buy": str(proposal_id),
+            "price": round(stake, 2),
+        }, timeout=12)
+        if not buy_resp:
+            return {"status": "error", "reason": "Timeout achat Deriv"}
+        if buy_resp.get("error"):
+            return {"status": "error", "reason": buy_resp["error"].get("message", "achat refusé")}
+
+        buy = buy_resp.get("buy") or {}
+        contract_id = buy.get("contract_id")
+        if not contract_id:
+            return {"status": "error", "reason": f"Réponse achat sans contract_id: {buy_resp}"}
+
+        entry = buy.get("start_spot") or buy.get("entry_spot") or proposal.get("spot")
+        try:
+            entry = float(entry) if entry is not None else None
+        except (TypeError, ValueError):
+            entry = None
+
+        log.info(
+            f"✅ Position Deriv ouverte: #{contract_id} {direction} "
+            f"{deriv_sym} stake={stake:.2f} mult={mult}"
+        )
         return {
             "status": "ok",
-            "contract_id": buy.get("contract_id"),
+            "contract_id": contract_id,
             "buy_price": buy.get("buy_price"),
-            "entry_spot": buy.get("start_time"),
+            "entry_spot": entry,
             "stake": stake,
             "multiplier": mult,
         }
 
     def get_contract_status(self, contract_id):
-        """Interroge l'état actuel d'un contrat ouvert (prix, profit, is_sold)."""
-        resp = self._request({"proposal_open_contract": 1, "contract_id": contract_id}, timeout=6)
+        resp = self._request(
+            {"proposal_open_contract": 1, "contract_id": int(contract_id)},
+            timeout=8,
+        )
         if not resp or resp.get("error"):
             return None
         poc = resp.get("proposal_open_contract")
-        if not poc:
+        if not isinstance(poc, dict):
             return None
+
+        def num(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def flag(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return v != 0
+            return str(v).strip().lower() in {"1", "true", "yes"}
+
         return {
-            "current_spot": poc.get("current_spot"),
-            "entry_spot":   poc.get("entry_spot"),
-            "profit":       poc.get("profit"),
-            "is_sold":      bool(poc.get("is_sold")),
-            "sell_price":   poc.get("sell_price"),
-            "status":       poc.get("status"),
+            "current_spot": num(poc.get("current_spot")),
+            "entry_spot": num(poc.get("entry_spot")),
+            "profit": num(poc.get("profit")),
+            "is_sold": flag(poc.get("is_sold", False)),
+            "sell_price": num(poc.get("sell_price") if poc.get("sell_price") is not None else poc.get("exit_spot")),
+            "status": poc.get("status"),
         }
 
     def update_sl(self, contract_id, new_sl_loss_amount):
-        """Modifie le stop_loss d'un contrat Multiplier déjà ouvert (trailing)."""
+        amount = max(0.01, float(new_sl_loss_amount))
         resp = self._request({
             "contract_update": 1,
-            "contract_id": contract_id,
-            "limit_order": {"stop_loss": round(max(0.01, new_sl_loss_amount), 2)},
-        }, timeout=6)
+            "contract_id": int(contract_id),
+            "limit_order": {"stop_loss": round(amount, 2)},
+        }, timeout=8)
         if not resp or resp.get("error"):
             reason = resp["error"].get("message") if resp and resp.get("error") else "timeout"
             log.warning(f"Deriv update_sl #{contract_id}: {reason}")
@@ -1435,14 +1711,17 @@ class DerivConn:
         return True
 
     def close_position(self, contract_id):
-        """Ferme un contrat au marché (pour le retournement immédiat en SAR)."""
-        resp = self._request({"sell": contract_id, "price": 0}, timeout=8)
+        resp = self._request({"sell": int(contract_id), "price": 0}, timeout=10)
         if not resp or resp.get("error"):
             reason = resp["error"].get("message") if resp and resp.get("error") else "timeout"
             log.warning(f"Deriv close #{contract_id}: {reason}")
             return {"status": "error", "reason": reason}
-        sell = resp.get("sell", {})
-        return {"status": "ok", "sold_for": sell.get("sold_for"), "contract_id": contract_id}
+        sell = resp.get("sell") or {}
+        return {
+            "status": "ok",
+            "sold_for": sell.get("sold_for"),
+            "contract_id": contract_id,
+        }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONNEXION MT5 (Exness, IC Markets, etc.)
@@ -1558,16 +1837,18 @@ class PositionManager:
         if result.get("status") != "ok":
             log.error(f"PositionManager.open {pair_id}: {result.get('reason')}")
             return None
+        actual_entry = result.get("entry_spot") or sig["price"]
         with self._lock:
             self.positions[pair_id] = {
                 "pair_id": pair_id,
                 "direction": direction,
                 "contract_id": result["contract_id"],
-                "entry_price": sig["price"],
+                "entry_price": float(actual_entry),
                 "initial_sl_price": sig["sl"],
                 "current_sl_price": sig["sl"],
                 "atr": sig["atr"],
-                "stake": stake,
+                "stake": float(result.get("stake", stake)),
+                "multiplier": int(result.get("multiplier", os.getenv("DERIV_DEFAULT_MULTIPLIER", "50"))),
                 "strategies": [k for k, v in sig.get("strategies", {}).items() if v.get("valid")],
                 "flips": 0,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -1604,12 +1885,30 @@ class PositionManager:
         if profit_R >= Config.SAR_ACTIVATION_R:
             if direction == "BUY":
                 candidate = current_price - trail_dist
-                if candidate - pos["current_sl_price"] >= min_trail:
-                    pos["current_sl_price"] = candidate
+                should_move = candidate - pos["current_sl_price"] >= min_trail
             else:
                 candidate = current_price + trail_dist
-                if pos["current_sl_price"] - candidate >= min_trail:
+                should_move = pos["current_sl_price"] - candidate >= min_trail
+
+            # On ne pousse le stop natif que dans une zone déjà gagnante.
+            # Cela évite de remplacer le filet de sécurité initial par un SL
+            # plus large simplement parce que l'ATR est momentanément élevé.
+            if should_move and (
+                (direction == "BUY" and candidate > pos["entry_price"]) or
+                (direction == "SELL" and candidate < pos["entry_price"])
+            ):
+                # Deriv Multiplier stop_loss est une perte monétaire, pas un prix.
+                # Conversion : stake × multiplier × pourcentage de distance prix.
+                new_loss = deriv._loss_amount_for_price(
+                    pos["stake"], pos["multiplier"], pos["entry_price"], candidate
+                )
+                # Le trailing doit seulement réduire le risque, jamais le relâcher.
+                if new_loss < pos["stake"] * 0.90 and deriv.update_sl(pos["contract_id"], new_loss):
                     pos["current_sl_price"] = candidate
+                    log.info(
+                        f"🔧 Trailing SL {pos['pair_id']} → {candidate:.6f} "
+                        f"(risque natif ≈ {new_loss:.2f} {deriv.currency})"
+                    )
 
     def _breached(self, pos, current_price):
         if pos["direction"] == "BUY":
@@ -1853,7 +2152,7 @@ def fetch_synth(pair_id, granularity=300, count=120):
         ws.send(json.dumps({"ticks_history":deriv_sym,"adjust_start_time":1,
                             "count":count,"end":"latest","start":1,
                             "style":"candles","granularity":granularity}))
-    url = f"{Config.DERIV_WS}?app_id={Config.DERIV_APP_ID}"
+    url = Config.DERIV_WS_PUBLIC
     ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_msg, on_error=on_err)
     t  = threading.Thread(target=ws.run_forever, daemon=True); t.start()
     deadline = time.time()+12
