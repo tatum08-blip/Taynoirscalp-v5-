@@ -80,10 +80,14 @@ class Config:
     MIN_CONF_PUBLIC    = float(os.getenv("MIN_CONF_PUBLIC", "82"))
     MIN_CONF_PREMIUM   = float(os.getenv("MIN_CONF_PREMIUM", "65"))
     # Actifs
-    ACTIVE_PAIRS = os.getenv(
-        "ACTIVE_PAIRS",
-        "XAUUSD,EURUSD,GBPUSD,GBPJPY,USDJPY,V75,V100,BOOM500,CRASH500,BOOM1000,CRASH1000"
-    ).split(",")
+    ACTIVE_PAIRS = [
+        p.strip().upper()
+        for p in os.getenv(
+            "ACTIVE_PAIRS",
+            "XAUUSD,EURUSD,GBPUSD,AUDUSD,USDJPY,GBPJPY,XAGUSD,NZDUSD,V25,V50,V75,V100"
+        ).split(",")
+        if p.strip()
+    ]
     # ── STOP AND REVERSE (SAR) ──────────────────────────────────────────
     SAR_ENABLED         = os.getenv("SAR_ENABLED", "true").lower() == "true"
     # Distance de trailing derrière le prix, en multiple de l'ATR(14)
@@ -1700,30 +1704,102 @@ position_manager = None  # instancié dans main() une fois deriv connecté
 # ══════════════════════════════════════════════════════════════════════════════
 _cache = {}
 
-def fetch_real(pair_id, interval="5min", count=120):
-    if not Config.TD_API_KEY: return None
+def fetch_real(pair_id, interval="5min", count=120, min_candles=80, max_retries=3):
+    """
+    Récupère des bougies réelles via Twelve Data pour un actif "real"
+    (forex/métaux). Durci pour diagnostiquer précisément chaque échec :
+    clé API absente, symbole non mappé, erreur réseau, réponse invalide,
+    ou nombre de bougies insuffisant — chaque cas logge la raison exacte.
+    """
+    if not Config.TD_API_KEY:
+        log.warning(f"fetch_real {pair_id}: TD_API_KEY absente — actif réel ignoré")
+        return None
+
+    pair = PAIRS.get(pair_id)
+    if not pair:
+        log.warning(f"fetch_real {pair_id}: actif inconnu dans PAIRS")
+        return None
+    td_symbol = pair.get("td")
+    if not td_symbol:
+        log.warning(f"fetch_real {pair_id}: pas de symbole Twelve Data mappé")
+        return None
+
     key = f"{pair_id}_{interval}"
     cached = _cache.get(key)
-    if cached and time.time()-cached["ts"] < 300:
+    if cached and time.time() - cached["ts"] < 300:
         return cached["data"]
-    try:
-        pair = PAIRS[pair_id]
-        r = requests.get(
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={pair['td']}&interval={interval}"
-            f"&outputsize={count}&apikey={Config.TD_API_KEY}",
-            timeout=15
-        )
-        data = r.json()
-        if data.get("status")=="error" or "values" not in data:
-            return None
-        candles = [{"open":float(v["open"]),"high":float(v["high"]),
-                    "low":float(v["low"]),"close":float(v["close"])}
-                   for v in reversed(data["values"])]
-        _cache[key] = {"data":candles,"ts":time.time()}
-        return candles
-    except Exception as e:
-        log.error(f"fetch_real {pair_id}: {e}"); return None
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": td_symbol,
+        "interval": interval,
+        "outputsize": count,
+        "apikey": Config.TD_API_KEY,
+    }
+
+    last_reason = "raison inconnue"
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            if r.status_code != 200:
+                last_reason = f"HTTP {r.status_code}"
+                log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+                time.sleep(1.5 * attempt)
+                continue
+
+            data = r.json()
+            if not isinstance(data, dict):
+                last_reason = "réponse JSON invalide (pas un objet)"
+                log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+                time.sleep(1.5 * attempt)
+                continue
+
+            if data.get("status") == "error":
+                last_reason = data.get("message", "erreur Twelve Data non précisée")
+                log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — API error: {last_reason}")
+                time.sleep(1.5 * attempt)
+                continue
+
+            values = data.get("values")
+            if not values or not isinstance(values, list):
+                last_reason = "champ 'values' absent ou vide dans la réponse"
+                log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+                time.sleep(1.5 * attempt)
+                continue
+
+            candles = []
+            for v in reversed(values):
+                try:
+                    candles.append({
+                        "open":  float(v["open"]),
+                        "high":  float(v["high"]),
+                        "low":   float(v["low"]),
+                        "close": float(v["close"]),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue  # bougie corrompue, on l'ignore plutôt que de faire planter tout le lot
+
+            if len(candles) < min_candles:
+                last_reason = f"seulement {len(candles)} bougies valides (minimum requis: {min_candles})"
+                log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+                time.sleep(1.5 * attempt)
+                continue
+
+            _cache[key] = {"data": candles, "ts": time.time()}
+            log.info(f"fetch_real {pair_id}: ✅ {len(candles)} bougies reçues (symbole TD: {td_symbol})")
+            return candles
+
+        except requests.exceptions.RequestException as e:
+            last_reason = f"erreur réseau: {e}"
+            log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+            time.sleep(1.5 * attempt)
+        except Exception as e:
+            last_reason = f"erreur inattendue: {e}"
+            log.error(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
+            time.sleep(1.5 * attempt)
+
+    log.error(f"fetch_real {pair_id}: ❌ échec après {max_retries} tentatives — {last_reason}")
+    return None
 
 def fetch_synth(pair_id, granularity=300, count=120):
     pair = PAIRS[pair_id]
@@ -2005,7 +2081,12 @@ def main():
     log.info(f"  Stop auto      : {Config.MAX_CONSEC_LOSSES} SL consécutifs")
     log.info(f"  Double IA      : {'✅' if Config.USE_DUAL_AI else '❌'}")
     log.info(f"  SAR (reversal) : {'✅' if Config.SAR_ENABLED else '❌'} | max flips: {Config.SAR_MAX_FLIPS}")
-    log.info(f"  Actifs         : {len(Config.ACTIVE_PAIRS)}")
+
+    known_pairs   = [p for p in Config.ACTIVE_PAIRS if p in PAIRS]
+    unknown_pairs = [p for p in Config.ACTIVE_PAIRS if p not in PAIRS]
+    log.info(f"  Actifs : {len(known_pairs)} | {', '.join(known_pairs)}")
+    if unknown_pairs:
+        log.warning(f"  ⚠️ Actifs inconnus (ignorés, absents de PAIRS) : {', '.join(unknown_pairs)}")
 
     # Connexions
     if Config.DERIV_TOKEN_DEMO or Config.DERIV_TOKEN_REAL:
