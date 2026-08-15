@@ -56,6 +56,10 @@ class Config:
     DERIV_TOKEN_DEMO   = os.getenv("DERIV_TOKEN_DEMO", "").strip()
     DERIV_TOKEN_REAL   = os.getenv("DERIV_TOKEN_REAL", "").strip()
     DERIV_API_BASE     = os.getenv("DERIV_API_BASE", "https://api.derivws.com").rstrip("/")
+    # Requis par Deriv à la création d'un compte Options — "row" est la seule
+    # valeur documentée dans leurs exemples. Si Deriv utilise un groupe différent
+    # pour ta région, ajuste via cette variable.
+    DERIV_ACCOUNT_GROUP = os.getenv("DERIV_ACCOUNT_GROUP", "row")
     # Historique de prix public (ticks_history) — ne nécessite AUCUNE authentification,
     # donc reste sur l'infrastructure classique, indépendamment du token/app_id.
     DERIV_WS_PUBLIC    = os.getenv("DERIV_WS_PUBLIC", "wss://ws.derivws.com/websockets/v3")
@@ -1296,17 +1300,51 @@ class DerivConn:
 
     def _ensure_account_id(self, token):
         """
-        Récupère (ou crée si besoin) l'account_id Options/Multipliers associé
-        à ce token. Deriv donne un compte demo par défaut à l'inscription,
-        donc ce POST renvoie généralement l'existant (200) plutôt que d'en
-        créer un nouveau (201) — les deux cas sont gérés.
+        Récupère l'account_id Options/Multipliers associé à ce token.
+        1) On essaie d'abord GET /accounts (liste ce qui existe déjà — la
+           plupart des comptes Deriv ont un compte demo par défaut, pas besoin
+           d'en créer un).
+        2) Si aucun compte du bon type (demo/real) n'existe, on en crée un via
+           POST — Deriv exige alors 3 champs obligatoires : currency, group,
+           account_type. Le "group" manquant causait l'erreur HTTP 422 vue en
+           logs.
         """
         account_type = "real" if Config.TRADE_MODE == "real" else "demo"
+        headers = self._account_headers(token)
+
+        try:
+            r = requests.get(
+                f"{Config.DERIV_API_BASE}/trading/v1/options/accounts",
+                headers=headers, timeout=10,
+            )
+            if r.status_code == 200:
+                accounts = r.json().get("data", [])
+                if isinstance(accounts, dict):
+                    accounts = [accounts]
+                for acc in accounts:
+                    if acc.get("account_type") == account_type:
+                        self.balance  = float(acc.get("balance", 0))
+                        self.currency = acc.get("currency", "USD")
+                        return acc["account_id"]
+            elif r.status_code == 401:
+                log.error("Deriv compte: HTTP 401 — token invalide ou application non autorisée")
+                return None
+            elif r.status_code == 403:
+                log.error("Deriv compte: HTTP 403 — le token n'a pas le scope 'trade'")
+                return None
+            # 404 ou liste vide -> aucun compte de ce type, on en crée un plus bas
+        except requests.exceptions.RequestException as e:
+            log.warning(f"Deriv compte (GET): erreur réseau — {e}, tentative de création directe")
+
         try:
             r = requests.post(
                 f"{Config.DERIV_API_BASE}/trading/v1/options/accounts",
-                headers=self._account_headers(token),
-                json={"currency": "USD", "account_type": account_type},
+                headers=headers,
+                json={
+                    "currency": "USD",
+                    "group": Config.DERIV_ACCOUNT_GROUP,
+                    "account_type": account_type,
+                },
                 timeout=10,
             )
             if r.status_code == 401:
@@ -1314,6 +1352,9 @@ class DerivConn:
                 return None
             if r.status_code == 403:
                 log.error("Deriv compte: HTTP 403 — le token n'a pas le scope nécessaire (vérifie 'trade' + 'account_manage')")
+                return None
+            if r.status_code == 422:
+                log.error(f"Deriv compte: HTTP 422 — requête rejetée par Deriv, détail: {r.text[:300]}")
                 return None
             if r.status_code == 429:
                 log.error("Deriv compte: HTTP 429 — trop de requêtes, on ralentit")
@@ -2082,19 +2123,22 @@ def main_scan():
     poll toutes les Config.POSITION_POLL_SEC secondes) qui gère le trailing
     et le stop-and-reverse — pas ce scan à 5 minutes, trop lent pour du scalping.
     """
-    if not market_open():
-        log.info("⏸ Marché fermé"); return
     if TradingGuard.is_paused(db):
         log.info(f"⏸ Bot pausé: {db['adaptive'].get('pause_reason','')}"); return
     if not TradingGuard.check_and_pause(db): return
 
+    fx_open = market_open()
     kz   = active_kz()
     cap  = db.get("capital", Config.CAPITAL)
     rp   = AdaptiveRisk.get_risk_pct(cap)
-    log.info(f"▶ SCAN | KZ: {kz['label'] if kz else 'Hors'} | Capital: {cap:.2f}$ | Risque: {rp}%")
+    log.info(f"▶ SCAN | Forex/métaux: {'ouvert' if fx_open else 'fermé (weekend)'} | KZ: {kz['label'] if kz else 'Hors'} | Capital: {cap:.2f}$ | Risque: {rp}%")
 
     for pair_id in Config.ACTIVE_PAIRS:
         if pair_id not in PAIRS: continue
+        # Les indices synthétiques (V25/V50/V75/V100...) tradent 24/7, y compris
+        # le weekend — seuls le forex et les métaux (or, argent) ferment.
+        if PAIRS[pair_id]["type"] == "real" and not fx_open:
+            continue
         if position_manager and position_manager.has_position(pair_id):
             continue  # une position SAR est déjà en cours de gestion sur cet actif
         try:
