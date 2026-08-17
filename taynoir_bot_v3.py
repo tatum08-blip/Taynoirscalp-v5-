@@ -62,7 +62,7 @@ class Config:
     DERIV_ACCOUNT_GROUP = os.getenv("DERIV_ACCOUNT_GROUP", "row")
     # Historique de prix public (ticks_history) — ne nécessite AUCUNE authentification,
     # donc reste sur l'infrastructure classique, indépendamment du token/app_id.
-    DERIV_WS_PUBLIC    = os.getenv("DERIV_WS_PUBLIC", "wss://ws.derivws.com/websockets/v3")
+    DERIV_WS_PUBLIC    = os.getenv("DERIV_WS_PUBLIC", "wss://api.derivws.com/trading/v1/options/ws/public")
     # Exness / MT5 universel
     MT5_LOGIN          = int(os.getenv("MT5_LOGIN", "0"))
     MT5_PASSWORD       = os.getenv("MT5_PASSWORD", "")
@@ -1983,11 +1983,13 @@ def fetch_synth(pair_id, granularity=300, count=120):
         ws.send(json.dumps({"ticks_history":deriv_sym,"adjust_start_time":1,
                             "count":count,"end":"latest","start":1,
                             "style":"candles","granularity":granularity}))
-    # Données publiques (pas de token requis) — app_id générique 1089 utilisable ici
-    # sans lien avec l'authentification du compte.
-    public_app_id = Config.DERIV_APP_ID or "1089"
-    url = f"{Config.DERIV_WS_PUBLIC}?app_id={public_app_id}"
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_msg, on_error=on_err)
+    # Nouvelle API publique Deriv — pas de app_id en paramètre d'URL, mais on
+    # envoie quand même le header Deriv-App-ID pour identifier l'application
+    # (l'ancien point de connexion ws.derivws.com rejette maintenant tout,
+    # d'où le passage à api.derivws.com/trading/v1/options/ws/public).
+    url = Config.DERIV_WS_PUBLIC
+    headers = [f"Deriv-App-ID: {Config.DERIV_APP_ID}"] if Config.DERIV_APP_ID else []
+    ws = websocket.WebSocketApp(url, header=headers, on_open=on_open, on_message=on_msg, on_error=on_err)
     t  = threading.Thread(target=ws.run_forever, daemon=True); t.start()
     deadline = time.time()+12
     while not result["done"] and time.time()<deadline: time.sleep(0.1)
