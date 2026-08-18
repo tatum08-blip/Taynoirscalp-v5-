@@ -85,7 +85,11 @@ class Config:
     # Confiance minimum pour trader
     MIN_CONF_TRADE     = float(os.getenv("MIN_CONF_TRADE", "78"))
     MIN_CONF_PUBLIC    = float(os.getenv("MIN_CONF_PUBLIC", "82"))
-    MIN_CONF_PREMIUM   = float(os.getenv("MIN_CONF_PREMIUM", "65"))
+    MIN_CONF_PREMIUM   = float(os.getenv("MIN_CONF_PREMIUM", "58"))
+    # Délai minimum avant de retrader la même paire dans le même sens — 1800s (30 min)
+    # était trop long pour du scalping (3-6 trades/jour visés). Réduit par défaut,
+    # ajustable si besoin.
+    DUP_COOLDOWN_SEC   = int(os.getenv("DUP_COOLDOWN_SEC", "600"))
     # Actifs
     ACTIVE_PAIRS = [
         p.strip().upper()
@@ -98,15 +102,15 @@ class Config:
     # ── STOP AND REVERSE (SAR) ──────────────────────────────────────────
     SAR_ENABLED         = os.getenv("SAR_ENABLED", "true").lower() == "true"
     # Distance de trailing derrière le prix, en multiple de l'ATR(14)
-    SAR_ATR_MULT        = float(os.getenv("SAR_ATR_MULT", "1.5"))
+    SAR_ATR_MULT        = float(os.getenv("SAR_ATR_MULT", "0.7"))
     # Le SL ne se resserre jamais plus près que ça (évite le micro-bruit)
     SAR_MIN_TRAIL_ATR   = float(os.getenv("SAR_MIN_TRAIL_ATR", "0.5"))
     # Ne commence à trailer qu'après ce niveau de profit (en R, càd multiple du risque initial)
-    SAR_ACTIVATION_R    = float(os.getenv("SAR_ACTIVATION_R", "0.5"))
+    SAR_ACTIVATION_R    = float(os.getenv("SAR_ACTIVATION_R", "0.2"))
     # Nombre max de retournements en chaîne avant pause automatique (protège contre le range)
     SAR_MAX_FLIPS       = int(os.getenv("SAR_MAX_FLIPS", "3"))
     # Fréquence de vérification des positions ouvertes (secondes) — scalping = rapide
-    POSITION_POLL_SEC   = float(os.getenv("POSITION_POLL_SEC", "3"))
+    POSITION_POLL_SEC   = float(os.getenv("POSITION_POLL_SEC", "2"))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MONEY MANAGEMENT ADAPTATIF
@@ -182,14 +186,14 @@ class AdaptiveRisk:
 #  ACTIFS
 # ══════════════════════════════════════════════════════════════════════════════
 PAIRS = {
-    "XAUUSD":    {"label":"🥇 XAU/USD",   "td":"XAU/USD",  "type":"real",  "pip":0.01,   "d":2,"upl":1,   "spread":0.5, "deriv":None},
-    "XAGUSD":    {"label":"🥈 XAG/USD",   "td":"XAG/USD",  "type":"real",  "pip":0.001,  "d":3,"upl":1,   "spread":0.3, "deriv":None},
-    "EURUSD":    {"label":"💶 EUR/USD",    "td":"EUR/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.2, "deriv":None},
-    "GBPUSD":    {"label":"💷 GBP/USD",    "td":"GBP/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.3, "deriv":None},
-    "USDJPY":    {"label":"💴 USD/JPY",    "td":"USD/JPY",  "type":"real",  "pip":0.01,   "d":3,"upl":10,  "spread":0.3, "deriv":None},
-    "GBPJPY":    {"label":"🔥 GBP/JPY",    "td":"GBP/JPY",  "type":"real",  "pip":0.01,   "d":3,"upl":10,  "spread":0.6, "deriv":None},
-    "AUDUSD":    {"label":"🦘 AUD/USD",    "td":"AUD/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.2, "deriv":None},
-    "NZDUSD":    {"label":"🥝 NZD/USD",    "td":"NZD/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.3, "deriv":None},
+    "XAUUSD":    {"label":"🥇 XAU/USD",   "td":"XAU/USD",  "type":"real",  "pip":0.01,   "d":2,"upl":1,   "spread":0.5, "deriv":"frxXAUUSD"},
+    "XAGUSD":    {"label":"🥈 XAG/USD",   "td":"XAG/USD",  "type":"real",  "pip":0.001,  "d":3,"upl":1,   "spread":0.3, "deriv":"frxXAGUSD"},
+    "EURUSD":    {"label":"💶 EUR/USD",    "td":"EUR/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.2, "deriv":"frxEURUSD"},
+    "GBPUSD":    {"label":"💷 GBP/USD",    "td":"GBP/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.3, "deriv":"frxGBPUSD"},
+    "USDJPY":    {"label":"💴 USD/JPY",    "td":"USD/JPY",  "type":"real",  "pip":0.01,   "d":3,"upl":10,  "spread":0.3, "deriv":"frxUSDJPY"},
+    "GBPJPY":    {"label":"🔥 GBP/JPY",    "td":"GBP/JPY",  "type":"real",  "pip":0.01,   "d":3,"upl":10,  "spread":0.6, "deriv":"frxGBPJPY"},
+    "AUDUSD":    {"label":"🦘 AUD/USD",    "td":"AUD/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.2, "deriv":"frxAUDUSD"},
+    "NZDUSD":    {"label":"🥝 NZD/USD",    "td":"NZD/USD",  "type":"real",  "pip":0.0001, "d":5,"upl":10,  "spread":0.3, "deriv":"frxNZDUSD"},
     "V75":       {"label":"🔮 Vol 75",     "td":None,       "type":"synth", "pip":0.001,  "d":3,"upl":0.1, "spread":0,   "deriv":"R_75"},
     "V100":      {"label":"⚡ Vol 100",    "td":None,       "type":"synth", "pip":0.001,  "d":3,"upl":0.1, "spread":0,   "deriv":"R_100"},
     "V25":       {"label":"🌊 Vol 25",     "td":None,       "type":"synth", "pip":0.001,  "d":3,"upl":0.1, "spread":0,   "deriv":"R_25"},
@@ -200,7 +204,14 @@ PAIRS = {
     "CRASH1000": {"label":"💥 Crash 1000", "td":None,       "type":"synth", "pip":0.1,    "d":1,"upl":0.1, "spread":0,   "deriv":"CRASH1000N"},
 }
 
-ALLOWED_DERIV = {"R_25","R_50","R_75","R_100","BOOM500N","BOOM1000N","CRASH500N","CRASH1000N"}
+# "frx..." = symboles Deriv pour le forex/métaux (confirmé par leur documentation
+# officielle, ex: frxEURUSD). Sans ça, ces actifs pouvaient être scannés mais
+# jamais réellement tradés — c'était le vrai trou qui rendait le bot "paresseux"
+# sur l'or et le forex.
+ALLOWED_DERIV = {
+    "R_25","R_50","R_75","R_100","BOOM500N","BOOM1000N","CRASH500N","CRASH1000N",
+    "frxXAUUSD","frxXAGUSD","frxEURUSD","frxGBPUSD","frxUSDJPY","frxGBPJPY","frxAUDUSD","frxNZDUSD",
+}
 
 KILL_ZONES = [
     {"id":"asia",   "label":"🌏 Asie",         "start":0,    "end":180,  "w":0.85},
@@ -1481,7 +1492,10 @@ class DerivConn:
     def _resolve_symbol(self, pair_id):
         pair = PAIRS[pair_id]
         deriv_sym = pair.get("deriv")
-        if pair["type"] != "synth" or not deriv_sym or deriv_sym not in ALLOWED_DERIV:
+        # Auparavant limité à "synth" uniquement — l'or et le forex ("real")
+        # ont maintenant leur symbole Deriv (frxXAUUSD etc) et peuvent trader
+        # exactement comme les indices synthétiques.
+        if not deriv_sym or deriv_sym not in ALLOWED_DERIV:
             return None
         return deriv_sym
 
@@ -1862,7 +1876,7 @@ position_manager = None  # instancié dans main() une fois deriv connecté
 # ══════════════════════════════════════════════════════════════════════════════
 _cache = {}
 
-def fetch_real(pair_id, interval="5min", count=120, min_candles=80, max_retries=3):
+def fetch_real(pair_id, interval="1min", count=120, min_candles=80, max_retries=3):
     """
     Récupère des bougies réelles via Twelve Data pour un actif "real"
     (forex/métaux). Durci pour diagnostiquer précisément chaque échec :
@@ -1959,7 +1973,7 @@ def fetch_real(pair_id, interval="5min", count=120, min_candles=80, max_retries=
     log.error(f"fetch_real {pair_id}: ❌ échec après {max_retries} tentatives — {last_reason}")
     return None
 
-def fetch_synth(pair_id, granularity=300, count=120):
+def fetch_synth(pair_id, granularity=60, count=120):
     pair = PAIRS[pair_id]
     deriv_sym = pair.get("deriv")
     if not deriv_sym or deriv_sym not in ALLOWED_DERIV: return None
@@ -2097,7 +2111,8 @@ deriv = DerivConn()
 mt5_c = MT5Conn()
 _last_sig = {}
 
-def is_dup(pair_id, direction, cooldown=1800):
+def is_dup(pair_id, direction, cooldown=None):
+    cooldown = cooldown if cooldown is not None else Config.DUP_COOLDOWN_SEC
     key=f"{pair_id}_{direction}"
     last=_last_sig.get(key)
     if last and time.time()-last < cooldown: return True
@@ -2170,14 +2185,14 @@ def main_scan():
 
             log.info(f"  ✅ Signal validé: {pair_id} {sig['direction']} conf={sig['confidence']:.0f}% | {ai_verdict[:60]}")
 
-            # Exécution — uniquement les actifs synthétiques Deriv pour l'instant
-            # (MT5 nécessite un VPS Windows séparé, voir MT5Conn.modify_sl pour le trailing MT5)
-            pair = PAIRS[pair_id]
-            if pair["type"] == "synth" and deriv.authorized and position_manager:
+            # Exécution via Deriv — indices synthétiques ET forex/métaux (frxXAUUSD
+            # etc) passent tous les deux par le même chemin maintenant. MT5 reste
+            # une option séparée non branchée ici (nécessiterait un VPS Windows).
+            if deriv.authorized and position_manager and deriv._resolve_symbol(pair_id):
                 stake = cap * (rp / 100)
                 position_manager.open(pair_id, sig, sig["direction"], stake)
-            elif pair["type"] == "real":
-                log.info(f"  {pair_id}: actif réel — exécution MT5 non branchée dans ce scan (voir MT5Conn)")
+            else:
+                log.info(f"  {pair_id}: pas de symbole Deriv exécutable — signal ignoré")
 
             time.sleep(0.4)
         except Exception as e:
@@ -2300,7 +2315,7 @@ def main():
         f"TAYNOIR v3 démarré | Capital {cap:.2f}$ | Risque {rp}% | Mode {Config.TRADE_MODE.upper()} | "
         f"SAR {'ON' if Config.SAR_ENABLED else 'OFF'}")
 
-    schedule.every(5).minutes.do(main_scan)
+    schedule.every(1).minutes.do(main_scan)
     schedule.every(1).minutes.do(daily_check)
     schedule.every(30).minutes.do(adaptive_update)
     schedule.every(30).seconds.do(deriv_supervisor)
