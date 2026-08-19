@@ -81,7 +81,15 @@ class Config:
     # Capital initial
     CAPITAL            = float(os.getenv("CAPITAL", "100"))
     # Stop auto après N SL consécutifs
-    MAX_CONSEC_LOSSES  = int(os.getenv("MAX_CONSEC_LOSSES", "4"))
+    MAX_CONSEC_LOSSES  = int(os.getenv("MAX_CONSEC_LOSSES", "6"))
+    # Nouveaux garde-fous — l'ancien système ne coupait que sur des PERTES
+    # CONSÉCUTIVES, jamais sur une perte cumulée en % du capital dans la
+    # journée, et rien n'empêchait d'ouvrir des positions sur 10 actifs en
+    # même temps (risque cumulé illimité).
+    MAX_DAILY_LOSS_PCT      = float(os.getenv("MAX_DAILY_LOSS_PCT", "6"))
+    # Positions simultanées sur n'importe quel actif — plus de plafond artificiel,
+    # limité seulement par le nombre d'actifs suivis (ACTIVE_PAIRS).
+    MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "50"))
     # Confiance minimum pour trader
     MIN_CONF_TRADE     = float(os.getenv("MIN_CONF_TRADE", "78"))
     MIN_CONF_PUBLIC    = float(os.getenv("MIN_CONF_PUBLIC", "82"))
@@ -101,6 +109,15 @@ class Config:
     ]
     # ── STOP AND REVERSE (SAR) ──────────────────────────────────────────
     SAR_ENABLED         = os.getenv("SAR_ENABLED", "true").lower() == "true"
+    # Pyramiding : renforcer une position gagnante quand le prix avance dans
+    # le bon sens (au lieu de garder une taille fixe du début à la fin).
+    SCALE_IN_ENABLED    = os.getenv("SCALE_IN_ENABLED", "true").lower() == "true"
+    # Déclenche un renfort tous les X R de profit (1R = distance du risque initial)
+    SCALE_IN_TRIGGER_R  = float(os.getenv("SCALE_IN_TRIGGER_R", "1.0"))
+    # Nombre max de renforts — 2 = position initiale doublée puis triplée
+    MAX_SCALE_INS       = int(os.getenv("MAX_SCALE_INS", "2"))
+    # Taille de chaque renfort, en multiple de la mise initiale
+    SCALE_IN_MULTIPLIER = float(os.getenv("SCALE_IN_MULTIPLIER", "1.0"))
     # Distance de trailing derrière le prix, en multiple de l'ATR(14)
     SAR_ATR_MULT        = float(os.getenv("SAR_ATR_MULT", "0.7"))
     # Le SL ne se resserre jamais plus près que ça (évite le micro-bruit)
@@ -124,12 +141,18 @@ class Config:
 class AdaptiveRisk:
     @staticmethod
     def get_risk_pct(capital: float) -> float:
-        if capital < 500:    return 5.0
-        if capital < 2000:   return 3.0
-        if capital < 5000:   return 2.0
-        if capital < 10000:  return 1.5
-        if capital < 20000:  return 1.0
-        return 0.75
+        # Relevé pour du scalping — <500$ : 5 à 10% selon la taille du compte
+        # (plus le compte est petit dans cette tranche, plus le % est haut,
+        # pour rester significatif en dollars). Autres tranches ajustées
+        # proportionnellement au même ratio.
+        if capital < 100:   return 10.0
+        if capital < 250:   return 8.0
+        if capital < 500:   return 6.0
+        if capital < 2000:  return 5.0
+        if capital < 5000:  return 3.5
+        if capital < 10000: return 2.5
+        if capital < 20000: return 1.75
+        return 1.25
 
     @staticmethod
     def calc_position(pair: dict, entry: float, sl: float, capital: float) -> dict | None:
@@ -936,6 +959,35 @@ class StrategyEngine:
 
     # ── COMBINAISON FINALE ────────────────────────────────────────────────────
     @staticmethod
+    @staticmethod
+    def _perf_multiplier(strategy_name):
+        """
+        AUTO-APPRENTISSAGE RÉEL : une stratégie avec un mauvais win rate en
+        LIVE (pas juste en backtest) voit son poids réduit dans le score
+        combiné — automatiquement, sans intervention manuelle. Avant, ces
+        stats existaient (strategy_perf) mais n'étaient utilisées que pour un
+        message de log, jamais pour influencer réellement les futurs signaux.
+
+        - Moins de 10 trades sur cette stratégie -> neutre (1.0), pas assez
+          de données pour juger.
+        - Win rate ≥ 65% -> poids renforcé (jusqu'à 1.3x)
+        - Win rate < 35% -> poids réduit (jusqu'à 0.4x), jamais coupé à zéro
+          (une stratégie peut retrouver sa place si elle redevient bonne).
+        """
+        s = db.get("strategy_perf", {}).get(strategy_name)
+        if not s:
+            return 1.0
+        total = s.get("wins", 0) + s.get("losses", 0)
+        if total < 10:
+            return 1.0
+        wr = s["wins"] / total
+        if wr >= 0.65:
+            return 1.0 + min(0.3, (wr - 0.65) * 2)
+        if wr < 0.35:
+            return max(0.4, 1.0 - (0.35 - wr) * 2)
+        return 1.0
+
+    @staticmethod
     def combine(pair_id, candles, kz=None):
         a = smc_analyze(pair_id, candles)
         if not a:
@@ -962,9 +1014,16 @@ class StrategyEngine:
         weights_core   = [0.28, 0.22, 0.18, 0.14, 0.08]  # total = 0.90
         weights_sniper = [0.02] * 5                        # total = 0.10
 
+        # Auto-apprentissage : chaque poids est ajusté selon la performance
+        # LIVE réelle de la stratégie correspondante (voir _perf_multiplier).
+        core_names   = ["smc", "ict", "pa", "momentum", "structure"]
+        sniper_names = ["ob_retest", "fvg_fill", "sweep_rev", "divergence", "session_open"]
+        adj_core   = [weights_core[i]   * StrategyEngine._perf_multiplier(core_names[i])   for i in range(5)]
+        adj_sniper = [weights_sniper[i] * StrategyEngine._perf_multiplier(sniper_names[i]) for i in range(5)]
+
         weighted_score = (
-            sum(cores[i]["score"]*weights_core[i] for i in range(5)) +
-            sum(snipers[i]["score"]*weights_sniper[i] for i in range(5))
+            sum(cores[i]["score"]*adj_core[i] for i in range(5)) +
+            sum(snipers[i]["score"]*adj_sniper[i] for i in range(5))
         )
 
         # Consensus : combien de stratégies sont dans le même sens
@@ -1195,17 +1254,30 @@ class DualAI:
 class TradingGuard:
     @staticmethod
     def check_and_pause(db_data):
-        """Arrête le bot après MAX_CONSEC_LOSSES SL consécutifs"""
+        """Arrête le bot après MAX_CONSEC_LOSSES SL consécutifs OU après une perte
+        journalière cumulée trop importante en % du capital — deux protections
+        différentes et complémentaires, pas juste l'une ou l'autre."""
         with db_lock:
             consec = db_data["perf"].get("consec_losses", 0)
+            today = datetime.now().strftime("%Y-%m-%d")
+            daily_pnl = db_data.get("daily", {}).get(today, {}).get("pnl", 0)
+            cap = db_data.get("capital", Config.CAPITAL)
+            daily_loss_pct = (-daily_pnl / cap * 100) if cap > 0 and daily_pnl < 0 else 0
+
+            reason = None
             if consec >= Config.MAX_CONSEC_LOSSES:
+                reason = f"{consec} SL consécutifs"
+            elif daily_loss_pct >= Config.MAX_DAILY_LOSS_PCT:
+                reason = f"perte journalière {daily_loss_pct:.1f}% ≥ limite {Config.MAX_DAILY_LOSS_PCT}%"
+
+            if reason:
                 # Pause jusqu'à minuit
                 tomorrow = (datetime.now() + timedelta(days=1)).replace(hour=0,minute=0,second=0)
                 db_data["adaptive"]["paused_until"] = tomorrow.isoformat()
-                db_data["adaptive"]["pause_reason"] = f"{consec} SL consécutifs"
+                db_data["adaptive"]["pause_reason"] = reason
                 save_db(db_data)
-                log.warning(f"🛑 BOT PAUSÉ — {consec} SL consécutifs — reprise {tomorrow.strftime('%H:%M')}")
-                Notifier.send("PAUSE", f"Bot pausé automatiquement — {consec} SL consécutifs. Reprise demain 00h00.")
+                log.warning(f"🛑 BOT PAUSÉ — {reason} — reprise {tomorrow.strftime('%H:%M')}")
+                Notifier.send("PAUSE", f"Bot pausé automatiquement — {reason}. Reprise demain 00h00.")
                 return False
             return True
 
@@ -1706,12 +1778,14 @@ class PositionManager:
             self.positions[pair_id] = {
                 "pair_id": pair_id,
                 "direction": direction,
-                "contract_id": result["contract_id"],
+                "contract_ids": [result["contract_id"]],  # liste car le pyramiding ajoute des contrats
                 "entry_price": sig["price"],
                 "initial_sl_price": sig["sl"],
                 "current_sl_price": sig["sl"],
                 "atr": sig["atr"],
-                "stake": stake,
+                "stake": stake,             # mise initiale (référence pour les renforts)
+                "total_stake": stake,       # mise totale cumulée (initiale + renforts)
+                "scale_ins": 0,
                 "strategies": [k for k, v in sig.get("strategies", {}).items() if v.get("valid")],
                 "flips": 0,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
@@ -1733,7 +1807,8 @@ class PositionManager:
         return self.positions[pair_id]
 
     def _trail(self, pos, current_price):
-        """Resserre le SL derrière le prix — jamais dans l'autre sens."""
+        """Resserre le SL derrière le prix — jamais dans l'autre sens.
+        Renforce aussi la position (pyramiding) si le prix avance bien."""
         direction = pos["direction"]
         atr = max(pos["atr"], 1e-9)
         trail_dist = atr * Config.SAR_ATR_MULT
@@ -1755,6 +1830,26 @@ class PositionManager:
                 if pos["current_sl_price"] - candidate >= min_trail:
                     pos["current_sl_price"] = candidate
 
+        self._maybe_scale_in(pos, profit_R)
+
+    def _maybe_scale_in(self, pos, profit_R):
+        """Double/triple la position quand le prix avance suffisamment dans le bon sens."""
+        if not Config.SCALE_IN_ENABLED or pos["scale_ins"] >= Config.MAX_SCALE_INS:
+            return
+        next_trigger = (pos["scale_ins"] + 1) * Config.SCALE_IN_TRIGGER_R
+        if profit_R < next_trigger:
+            return
+        add_stake = pos["stake"] * Config.SCALE_IN_MULTIPLIER
+        result = deriv.open_position(pos["pair_id"], pos["direction"], add_stake, 0)
+        if result.get("status") != "ok":
+            log.warning(f"Scale-in {pos['pair_id']}: échec ({result.get('reason')}) — position gardée telle quelle")
+            return
+        pos["contract_ids"].append(result["contract_id"])
+        pos["total_stake"] += add_stake
+        pos["scale_ins"] += 1
+        Notifier.send("SCALE_IN",
+            f"{pos['pair_id']} renforcé (x{pos['scale_ins']+1}) à +{profit_R:.1f}R | stake ajoutée {add_stake:.2f}$")
+
     def _breached(self, pos, current_price):
         if pos["direction"] == "BUY":
             return current_price <= pos["current_sl_price"]
@@ -1775,10 +1870,15 @@ class PositionManager:
             save_db(db)
 
     def _flip(self, pair_id, pos, current_price):
-        close_res = deriv.close_position(pos["contract_id"])
-        status = deriv.get_contract_status(pos["contract_id"])
-        pnl = status["profit"] if status and status.get("profit") is not None else \
-              (close_res.get("sold_for", pos["stake"]) - pos["stake"] if close_res.get("status") == "ok" else -pos["stake"])
+        # Ferme TOUS les contrats du groupe (mise initiale + renforts pyramidés)
+        total_pnl = 0.0
+        for cid in pos["contract_ids"]:
+            close_res = deriv.close_position(cid)
+            status = deriv.get_contract_status(cid)
+            leg_pnl = status["profit"] if status and status.get("profit") is not None else \
+                      (close_res.get("sold_for", 0) - 0 if close_res.get("status") == "ok" else 0)
+            total_pnl += leg_pnl or 0
+        pnl = total_pnl
         won = pnl > 0
         self._record_close(pos, pnl, won)
 
@@ -1818,11 +1918,13 @@ class PositionManager:
         with self._lock:
             pos.update({
                 "direction": new_direction,
-                "contract_id": result["contract_id"],
+                "contract_ids": [result["contract_id"]],  # on repart d'un seul contrat après un flip
                 "entry_price": current_price,
                 "initial_sl_price": new_sl,
                 "current_sl_price": new_sl,
                 "stake": stake,
+                "total_stake": stake,
+                "scale_ins": 0,
             })
         with db_lock:
             db["trades"].append({
@@ -1842,15 +1944,25 @@ class PositionManager:
             pos = self.positions.get(pair_id)
             if not pos:
                 continue
-            status = deriv.get_contract_status(pos["contract_id"])
+            primary_id = pos["contract_ids"][0]
+            status = deriv.get_contract_status(primary_id)
             if not status:
                 continue
             if status["is_sold"]:
-                pnl = status.get("profit", -pos["stake"]) or -pos["stake"]
-                self._record_close(pos, pnl, pnl > 0)
+                # Le contrat principal a été fermé côté broker (SL natif) —
+                # on ferme aussi les éventuels renforts (pyramiding) et on
+                # additionne le PnL de tous les contrats du groupe.
+                total_pnl = status.get("profit", 0) or 0
+                for cid in pos["contract_ids"][1:]:
+                    s2 = deriv.get_contract_status(cid)
+                    if s2 and not s2.get("is_sold"):
+                        deriv.close_position(cid)
+                        s2 = deriv.get_contract_status(cid)
+                    total_pnl += (s2.get("profit", 0) if s2 else 0) or 0
+                self._record_close(pos, total_pnl, total_pnl > 0)
                 with self._lock:
                     self.positions.pop(pair_id, None)
-                Notifier.send("CLOSE", f"{pair_id} clôturé côté broker (SL natif atteint) | PnL {pnl:.2f}$")
+                Notifier.send("CLOSE", f"{pair_id} clôturé côté broker (SL natif atteint) | PnL {total_pnl:.2f}$")
                 continue
             current_price = status["current_spot"]
             if current_price is None:
@@ -2158,6 +2270,9 @@ def main_scan():
             continue
         if position_manager and position_manager.has_position(pair_id):
             continue  # une position SAR est déjà en cours de gestion sur cet actif
+        if position_manager and len(position_manager.positions) >= Config.MAX_CONCURRENT_POSITIONS:
+            log.info(f"  {pair_id}: limite de {Config.MAX_CONCURRENT_POSITIONS} positions simultanées atteinte — signal ignoré")
+            continue
         try:
             candles = fetch_candles(pair_id)
             if not candles or len(candles) < 20:
