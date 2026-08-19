@@ -86,12 +86,20 @@ class Config:
     # CONSÉCUTIVES, jamais sur une perte cumulée en % du capital dans la
     # journée, et rien n'empêchait d'ouvrir des positions sur 10 actifs en
     # même temps (risque cumulé illimité).
-    MAX_DAILY_LOSS_PCT      = float(os.getenv("MAX_DAILY_LOSS_PCT", "6"))
+    # Doit rester AU-DESSUS du risque max par trade (10% pour les petits comptes,
+    # voir AdaptiveRisk.get_risk_pct) — sinon un seul trade perdant suffirait à
+    # dépasser une protection censée ne se déclencher qu'après PLUSIEURS pertes
+    # cumulées dans la journée, ce qui la rendrait inutile.
+    MAX_DAILY_LOSS_PCT      = float(os.getenv("MAX_DAILY_LOSS_PCT", "20"))
     # Positions simultanées sur n'importe quel actif — plus de plafond artificiel,
     # limité seulement par le nombre d'actifs suivis (ACTIVE_PAIRS).
     MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "50"))
     # Confiance minimum pour trader
-    MIN_CONF_TRADE     = float(os.getenv("MIN_CONF_TRADE", "78"))
+    # C'est LE seuil réel qui décide si un trade se prend, en live ET en
+    # backtest (avant, deux seuils différents coexistaient de façon confuse —
+    # MIN_CONF_TRADE ne servait qu'au backtest, MIN_CONF_PREMIUM gouvernait le
+    # live sans que ce soit visible dans son nom. Fusionné en une seule vérité.)
+    MIN_CONF_TRADE     = float(os.getenv("MIN_CONF_TRADE", "55"))
     MIN_CONF_PUBLIC    = float(os.getenv("MIN_CONF_PUBLIC", "82"))
     MIN_CONF_PREMIUM   = float(os.getenv("MIN_CONF_PREMIUM", "58"))
     # Délai minimum avant de retrader la même paire dans le même sens — 1800s (30 min)
@@ -103,7 +111,7 @@ class Config:
         p.strip().upper()
         for p in os.getenv(
             "ACTIVE_PAIRS",
-            "XAUUSD,EURUSD,GBPUSD,AUDUSD,USDJPY,GBPJPY,XAGUSD,NZDUSD,V25,V50,V75,V100"
+            "XAUUSD"
         ).split(",")
         if p.strip()
     ]
@@ -1109,12 +1117,16 @@ class StrategyEngine:
             all_reasons.extend(r.get("reasons", []))
         reasons = list(dict.fromkeys(all_reasons))[:12]
 
-        # DÉTECTION AUTOMATIQUE SCALP vs SWING
-        # Un signal fort (confluence multi-timeframe + confiance élevée) suggère
-        # un mouvement qui a plus de chances de continuer loin -> on vise plus
-        # large (swing, RR jusqu'à 5+). Un signal plus faible/ordinaire reste en
-        # scalp (sorties rapides, RR minimum 2 déjà en place ci-dessus).
-        trade_mode = "swing" if (mtf_aligned and confidence >= 75) else "scalp"
+        # DÉTECTION SCALP vs SWING — comparaison réelle, pas une règle figée.
+        # On évalue objectivement la force de la tendance (ADX, déjà calculé
+        # par le moteur SMC) plutôt que de trancher sur un seuil arbitraire.
+        # ADX > 25 = tendance établie -> un swing a statistiquement plus de
+        # chances d'atteindre un objectif éloigné. ADX faible = marché plus
+        # indécis/en range -> le scalp (sorties rapides) est plus cohérent,
+        # peu importe la confiance du signal d'entrée.
+        adx = a.get("adx", 0)
+        trend_score = adx + (15 if mtf_aligned else 0) + (confidence - 60) * 0.3
+        trade_mode = "swing" if trend_score >= 35 else "scalp"
         if direction and trade_mode == "swing":
             # Élargit les objectifs pour laisser le mouvement se développer.
             if direction == "BUY":
@@ -1138,7 +1150,7 @@ class StrategyEngine:
                 f"{'Achat' if direction=='BUY' else 'Vente'} déclenché à {confidence:.0f}% de confiance "
                 f"({buy_count}/10 BUY · {sell_count}/10 SELL). "
                 f"Raisons principales : {top_reasons}.{mtf_txt}{kz_txt} "
-                f"Mode {trade_mode} — objectif RR jusqu'à 1:{rr3:.1f}."
+                f"Mode {trade_mode} (ADX {adx:.0f}) — objectif RR jusqu'à 1:{rr3:.1f}."
             )
 
         return {
@@ -2050,6 +2062,10 @@ def fetch_real(pair_id, interval="1min", count=120, min_candles=80, max_retries=
 
     key = f"{pair_id}_{interval}"
     cached = _cache.get(key)
+    # 180s au lieu de 300s aurait été plus réactif pour du scalping, mais le
+    # quota JOURNALIER (souvent 800 requêtes/jour en gratuit) est la vraie
+    # contrainte — 300s de cache reste un compromis raisonnable pour ne pas
+    # épuiser le quota en quelques heures avec plusieurs actifs suivis.
     if cached and time.time() - cached["ts"] < 300:
         return cached["data"]
 
@@ -2065,6 +2081,12 @@ def fetch_real(pair_id, interval="1min", count=120, min_candles=80, max_retries=
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, params=params, timeout=15)
+            if r.status_code == 401:
+                # 401 = clé invalide/suspendue (différent d'un 429 "trop de
+                # requêtes") — réessayer ne sert à rien, c'est un problème de
+                # clé, pas de fréquence. On arrête tout de suite.
+                log.error(f"fetch_real {pair_id}: ❌ HTTP 401 — clé Twelve Data invalide ou suspendue (vérifie TD_API_KEY et ton quota sur twelvedata.com)")
+                return None
             if r.status_code != 200:
                 last_reason = f"HTTP {r.status_code}"
                 log.warning(f"fetch_real {pair_id}: tentative {attempt}/{max_retries} — {last_reason}")
@@ -2324,7 +2346,7 @@ def main_scan():
 
             log.info(f"  {pair_id}: {sig['direction']} {sig['confidence']:.0f}% | {sig['consensus']} | Snipers: {sig.get('sniper_valid',0)}/5")
 
-            if not sig["direction"] or sig["confidence"] < Config.MIN_CONF_PREMIUM:
+            if not sig["tradeable"]:
                 continue
             if is_dup(pair_id, sig["direction"]):
                 log.info(f"  {pair_id}: doublon ignoré"); continue
