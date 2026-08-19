@@ -1107,6 +1107,39 @@ class StrategyEngine:
         all_reasons = []
         for r in cores + snipers:
             all_reasons.extend(r.get("reasons", []))
+        reasons = list(dict.fromkeys(all_reasons))[:12]
+
+        # DÉTECTION AUTOMATIQUE SCALP vs SWING
+        # Un signal fort (confluence multi-timeframe + confiance élevée) suggère
+        # un mouvement qui a plus de chances de continuer loin -> on vise plus
+        # large (swing, RR jusqu'à 5+). Un signal plus faible/ordinaire reste en
+        # scalp (sorties rapides, RR minimum 2 déjà en place ci-dessus).
+        trade_mode = "swing" if (mtf_aligned and confidence >= 75) else "scalp"
+        if direction and trade_mode == "swing":
+            # Élargit les objectifs pour laisser le mouvement se développer.
+            if direction == "BUY":
+                tp2 = price + abs(price-sl) * 3.5
+                tp3 = price + abs(price-sl) * 6.0
+            else:
+                tp2 = price - abs(sl-price) * 3.5
+                tp3 = price - abs(sl-price) * 6.0
+            tp2 = round(tp2, pair["d"]); tp3 = round(tp3, pair["d"])
+            rr2 = AdaptiveRisk.calc_rr(price, sl, tp2, direction)
+            rr3 = AdaptiveRisk.calc_rr(price, sl, tp3, direction)
+
+        # EXPLICATION LISIBLE — pourquoi ce trade a été pris, en une phrase claire,
+        # pas juste des chiffres bruts.
+        explanation = None
+        if direction:
+            top_reasons = ", ".join(reasons[:4]) if reasons else "confluence de plusieurs stratégies"
+            mtf_txt = " Confirmé aussi sur le timeframe supérieur (H1)." if mtf_aligned else ""
+            kz_txt  = f" Pendant la zone horaire {kz['label']}." if kz else ""
+            explanation = (
+                f"{'Achat' if direction=='BUY' else 'Vente'} déclenché à {confidence:.0f}% de confiance "
+                f"({buy_count}/10 BUY · {sell_count}/10 SELL). "
+                f"Raisons principales : {top_reasons}.{mtf_txt}{kz_txt} "
+                f"Mode {trade_mode} — objectif RR jusqu'à 1:{rr3:.1f}."
+            )
 
         return {
             "direction":    direction,
@@ -1122,7 +1155,9 @@ class StrategyEngine:
             "tp3":          round(tp3,  pair["d"]),
             "rr1":          rr1, "rr2": rr2, "rr3": rr3,
             "atr":          atr,
-            "reasons":      list(dict.fromkeys(all_reasons))[:12],
+            "reasons":      reasons,
+            "explanation":  explanation,
+            "trade_mode":   trade_mode if direction else None,
             "strategies": {
                 "smc":r_smc,"ict":r_ict,"pa":r_pa,"momentum":r_mom,"structure":r_str,
                 "ob_retest":r_s1,"fvg_fill":r_s2,"sweep_rev":r_s3,
@@ -1798,12 +1833,17 @@ class PositionManager:
                 "rr1": sig.get("rr1"), "lot": stake, "risk_usd": stake,
                 "time": datetime.now(timezone.utc).isoformat(),
                 "status": "open", "pnl": 0, "mode": Config.TRADE_MODE, "sar_flip": 0,
+                "trade_style": sig.get("trade_mode"),   # "scalp" ou "swing"
+                "explanation": sig.get("explanation"),  # pourquoi ce trade a été pris
             })
             # NB: perf["total"] est incrémenté à la CLÔTURE (dans TradingGuard.record_result),
             # pas ici à l'ouverture — sinon chaque trade est compté deux fois et le win rate
             # affiché est faussé.
             save_db(db)
-        Notifier.send("OPEN", f"{direction} {pair_id} @ {sig['price']} | SL initial {sig['sl']}", {"pair": pair_id})
+        Notifier.send("OPEN",
+            f"{direction} {pair_id} @ {sig['price']} | SL initial {sig['sl']} | "
+            f"{sig.get('explanation', '')}",
+            {"pair": pair_id})
         return self.positions[pair_id]
 
     def _trail(self, pos, current_price):
@@ -2299,6 +2339,7 @@ def main_scan():
                 log.info(f"  {pair_id}: IA a rejeté — {ai_verdict}"); continue
 
             log.info(f"  ✅ Signal validé: {pair_id} {sig['direction']} conf={sig['confidence']:.0f}% | {ai_verdict[:60]}")
+            log.info(f"     💡 {sig.get('explanation', '')}")
 
             # Exécution via Deriv — indices synthétiques ET forex/métaux (frxXAUUSD
             # etc) passent tous les deux par le même chemin maintenant. MT5 reste
